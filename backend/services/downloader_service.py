@@ -17,9 +17,28 @@ TEMP_DIR = Path(__file__).resolve().parent.parent / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 
 
+def get_ffmpeg_path() -> Optional[str]:
+    """Find FFmpeg executable from system PATH or imageio-ffmpeg package."""
+    # 1. Check system PATH
+    sys_ffmpeg = shutil.which('ffmpeg')
+    if sys_ffmpeg:
+        return sys_ffmpeg
+
+    # 2. Check imageio-ffmpeg package
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            return exe
+    except Exception:
+        pass
+
+    return None
+
+
 def is_ffmpeg_available() -> bool:
-    """Check if FFmpeg is available on the system PATH."""
-    return shutil.which('ffmpeg') is not None
+    """Check if FFmpeg is available on system PATH or via imageio-ffmpeg."""
+    return get_ffmpeg_path() is not None
 
 
 def sanitize_filename(name: str) -> str:
@@ -186,14 +205,11 @@ class DownloaderService:
                         pass
             elif d['status'] == 'finished':
                 job.status = "processing"
-                filename = d.get('filename', '')
-                if filename:
-                    job.file_path = filename
-                    job.file_name = os.path.basename(filename)
 
         # --- Format selection strategy ---
-        # ISSUE 2: Prefer H.264/AVC video + AAC audio for Windows compatibility
-        has_ffmpeg = is_ffmpeg_available()
+        # Prefer H.264/AVC video + AAC audio merged into MP4 for full video & audio compatibility
+        ffmpeg_path = get_ffmpeg_path()
+        has_ffmpeg = ffmpeg_path is not None
 
         if has_ffmpeg:
             # FFmpeg available: prefer H.264 + AAC merge into MP4
@@ -205,14 +221,7 @@ class DownloaderService:
                 'best'
             )
         else:
-            # No FFmpeg: cannot merge separate streams.
-            # Pick best single H.264 stream (video-only), fallback to any single stream.
-            format_str = (
-                'bestvideo[vcodec^=avc1][protocol=https]/'
-                'bestvideo[protocol=https]/'
-                'bestaudio[protocol=https]/'
-                'best'
-            )
+            format_str = 'best'
 
         ydl_opts = {
             'outtmpl': outtmpl,
@@ -224,8 +233,9 @@ class DownloaderService:
             'windowsfilenames': True,
         }
 
-        # If FFmpeg available, request MP4 container via merge_output_format
-        if has_ffmpeg:
+        # If FFmpeg available, pass executable location and request MP4 container output
+        if ffmpeg_path:
+            ydl_opts['ffmpeg_location'] = ffmpeg_path
             ydl_opts['merge_output_format'] = 'mp4'
 
         loop = asyncio.get_event_loop()
@@ -236,8 +246,23 @@ class DownloaderService:
             def perform_download():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(job.url, download=True)
-                    # Resolve final filename within the ydl context
-                    resolved_path = job.file_path or ydl.prepare_filename(info)
+                    # Prepare final filename from info dictionary
+                    target_path = ydl.prepare_filename(info)
+                    base_path, _ = os.path.splitext(target_path)
+                    
+                    # If merged into MP4 container, check for .mp4 extension
+                    mp4_path = base_path + '.mp4'
+                    if os.path.exists(mp4_path):
+                        resolved_path = mp4_path
+                    elif os.path.exists(target_path):
+                        resolved_path = target_path
+                    else:
+                        # Fallback to any file created in TEMP_DIR matching base_path
+                        resolved_path = target_path
+                        for f in TEMP_DIR.glob(os.path.basename(base_path) + '.*'):
+                            if f.is_file() and not str(f).endswith(('.part', '.ytdl')):
+                                resolved_path = str(f)
+                                break
                     return info, resolved_path
 
             info, resolved_path = await loop.run_in_executor(None, perform_download)
